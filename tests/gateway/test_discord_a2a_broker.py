@@ -14,8 +14,7 @@ class FakeTextChannel:
         self.parent_id = None
 
 
-def _adapter(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def _adapter(monkeypatch):
     monkeypatch.setenv("A2A_DISCORD_ENABLED", "true")
     monkeypatch.setenv("A2A_DISCORD_CHANNEL_ID", "111")
     monkeypatch.setenv("A2A_DISCORD_PEER_USER_ID", "222")
@@ -36,8 +35,8 @@ def _message(content: str, *, author_id: int = 222, channel_id: int = 111, menti
     )
 
 
-def test_a2a_allows_peer_start_message(tmp_path, monkeypatch):
-    adapter = _adapter(tmp_path, monkeypatch)
+def test_a2a_allows_peer_start_message(monkeypatch):
+    adapter = _adapter(monkeypatch)
     adapter._client.user = _message("x").mentions[0]
 
     allowed = adapter._a2a_allows_bot_message(
@@ -47,8 +46,8 @@ def test_a2a_allows_peer_start_message(tmp_path, monkeypatch):
     assert allowed is True
 
 
-def test_a2a_terminal_marker_closes_without_model_dispatch(tmp_path, monkeypatch):
-    adapter = _adapter(tmp_path, monkeypatch)
+def test_a2a_terminal_marker_closes_without_model_dispatch(monkeypatch):
+    adapter = _adapter(monkeypatch)
     adapter._client.user = _message("x").mentions[0]
     assert adapter._a2a_allows_bot_message(
         _message("<@999> a2a:start diagnose envoy routing", msg_id=10)
@@ -66,8 +65,8 @@ def test_a2a_terminal_marker_closes_without_model_dispatch(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("content", ["noted", "copy", ".", "✅", "standing by"])
-def test_a2a_ack_only_messages_close_without_dispatch(tmp_path, monkeypatch, content):
-    adapter = _adapter(tmp_path, monkeypatch)
+def test_a2a_ack_only_messages_close_without_dispatch(monkeypatch, content):
+    adapter = _adapter(monkeypatch)
     adapter._client.user = _message("x").mentions[0]
     assert adapter._a2a_allows_bot_message(
         _message("<@999> a2a:start diagnose envoy routing", msg_id=10)
@@ -79,8 +78,8 @@ def test_a2a_ack_only_messages_close_without_dispatch(tmp_path, monkeypatch, con
     ) is False
 
 
-def test_a2a_rejects_non_peer_and_missing_mention(tmp_path, monkeypatch):
-    adapter = _adapter(tmp_path, monkeypatch)
+def test_a2a_rejects_non_peer_and_missing_mention(monkeypatch):
+    adapter = _adapter(monkeypatch)
     adapter._client.user = _message("x").mentions[0]
 
     assert adapter._a2a_allows_bot_message(
@@ -91,11 +90,10 @@ def test_a2a_rejects_non_peer_and_missing_mention(tmp_path, monkeypatch):
     ) is False
 
 
-def test_a2a_requires_start_marker_for_idle_thread(tmp_path, monkeypatch):
-    adapter = _adapter(tmp_path, monkeypatch)
+def test_a2a_requires_start_marker_for_idle_thread(monkeypatch):
+    adapter = _adapter(monkeypatch)
     adapter._client.user = _message("x").mentions[0]
 
     assert adapter._a2a_allows_bot_message(
         _message("<@999> can you check this without a start marker?")
     ) is False
-
