@@ -26,6 +26,8 @@ def _adapter(monkeypatch):
 
 def _message(content: str, *, author_id: int = 222, channel_id: int = 111, mentions_self: bool = True, msg_id: int = 1):
     self_user = SimpleNamespace(id=999)
+    if mentions_self and f"<@{self_user.id}>" not in content and f"<@!{self_user.id}>" not in content:
+        content = f"<@{self_user.id}> {content}".strip()
     return SimpleNamespace(
         id=msg_id,
         content=content,
@@ -62,6 +64,35 @@ def test_a2a_terminal_marker_closes_without_model_dispatch(monkeypatch):
 
     assert terminal_allowed is False
     assert followup_allowed is False
+    assert adapter._load_a2a_state()["111"]["state"] == "done"
+
+
+def test_a2a_stop_marker_records_stopped_state(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    adapter._client.user = _message("x").mentions[0]
+    assert adapter._a2a_allows_bot_message(
+        _message("a2a:start diagnose envoy routing", msg_id=10)
+    )
+
+    assert adapter._a2a_allows_bot_message(_message("a2a:stop pause here", msg_id=11)) is False
+
+    assert adapter._load_a2a_state()["111"]["state"] == "stopped"
+
+
+def test_a2a_start_reopens_terminal_conversation(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    adapter._client.user = _message("x").mentions[0]
+    assert adapter._a2a_allows_bot_message(
+        _message("a2a:start first pass", msg_id=10)
+    )
+    assert adapter._a2a_allows_bot_message(_message("a2a:done first pass", msg_id=11)) is False
+
+    assert adapter._a2a_allows_bot_message(_message("a2a:start second pass", msg_id=12)) is True
+
+    record = adapter._load_a2a_state()["111"]
+    assert record["state"] == "open"
+    assert record["turn_count"] == 1
+    assert record["last_message_id"] == "12"
 
 
 @pytest.mark.parametrize("content", ["noted", "copy", ".", "✅", "standing by"])

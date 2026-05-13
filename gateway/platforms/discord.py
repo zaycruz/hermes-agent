@@ -523,12 +523,24 @@ class DiscordAdapter(BasePlatformAdapter):
         stripped = text.strip().lower()
         for marker in ("a2a:done", "a2a:stop", "a2a:blocked"):
             if stripped.startswith(marker):
-                return True, marker.split(":", 1)[1]
+                state = marker.split(":", 1)[1]
+                return True, "stopped" if state == "stop" else state
         return False, None
 
     def _is_a2a_start(self, text: str) -> bool:
         stripped = text.strip().lower()
         return stripped.startswith("a2a:start") or stripped.startswith("a2a:handoff") or " a2a:start" in stripped or " a2a:handoff" in stripped
+
+    def _a2a_text_without_self_mention(self, text: str) -> str:
+        stripped = text.strip()
+        user = getattr(self._client, "user", None) if self._client else None
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            return stripped
+        for mention in (f"<@{user_id}>", f"<@!{user_id}>"):
+            if stripped.startswith(mention):
+                return stripped[len(mention):].lstrip()
+        return stripped
 
     def _is_a2a_ack_only(self, text: str) -> bool:
         stripped = text.strip().lower()
@@ -570,30 +582,38 @@ class DiscordAdapter(BasePlatformAdapter):
         state = self._load_a2a_state()
         record = state.get(key) if isinstance(state.get(key), dict) else {}
         status = str(record.get("state") or "idle")
+        text = str(getattr(message, "content", "") or "")
+        broker_text = self._a2a_text_without_self_mention(text)
+        starts_conversation = self._is_a2a_start(broker_text)
         if status in {"done", "stopped", "blocked", "expired"}:
-            return False
+            if not starts_conversation:
+                return False
+            record = {}
+            status = "idle"
         expires_at = float(record.get("expires_at") or 0)
         if expires_at and now > expires_at:
-            record["state"] = "expired"
-            state[key] = record
-            self._save_a2a_state(state)
-            return False
+            if not starts_conversation:
+                record["state"] = "expired"
+                state[key] = record
+                self._save_a2a_state(state)
+                return False
+            record = {}
+            status = "idle"
 
-        text = str(getattr(message, "content", "") or "")
-        terminal, terminal_state = self._is_a2a_terminal(text)
+        terminal, terminal_state = self._is_a2a_terminal(broker_text)
         if terminal:
             record.update({"state": terminal_state or "done", "terminal_message_id": str(getattr(message, "id", "")), "updated_at": now})
             state[key] = record
             self._save_a2a_state(state)
             return False
 
-        if self._is_a2a_ack_only(text):
+        if self._is_a2a_ack_only(broker_text):
             record.update({"state": "done", "terminal_reason": "ack_only", "updated_at": now})
             state[key] = record
             self._save_a2a_state(state)
             return False
 
-        if status == "idle" and not self._is_a2a_start(text):
+        if status == "idle" and not starts_conversation:
             return False
 
         turn_count = int(record.get("turn_count") or 0)
