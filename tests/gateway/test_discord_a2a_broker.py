@@ -20,7 +20,7 @@ def adapter(monkeypatch, _isolate_hermes_home):
     monkeypatch.setenv("A2A_DISCORD_CHANNEL_ID", "111")
     monkeypatch.setenv("A2A_DISCORD_PEER_USER_ID", "222")
     monkeypatch.setenv("A2A_DISCORD_MAX_TURNS", "4")
-    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))  # nosec B106: test-only token
     adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
     return adapter
 
