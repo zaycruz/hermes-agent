@@ -1,11 +1,46 @@
 """Tests for Discord A2A broker enforcement."""
 
+import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.discord import DiscordAdapter
+
+
+def _ensure_discord_mock():
+    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+        return
+
+    discord_mod = MagicMock()
+    discord_mod.Intents.default.return_value = MagicMock()
+    discord_mod.DMChannel = type("DMChannel", (), {})
+    discord_mod.Thread = type("Thread", (), {})
+    discord_mod.ForumChannel = type("ForumChannel", (), {})
+    discord_mod.Interaction = object
+    discord_mod.app_commands = SimpleNamespace(
+        describe=lambda **kwargs: (lambda fn: fn),
+        choices=lambda **kwargs: (lambda fn: fn),
+        Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    ext_mod = MagicMock()
+    commands_mod = MagicMock()
+    commands_mod.Bot = MagicMock
+    ext_mod.commands = commands_mod
+
+    sys.modules.setdefault("discord", discord_mod)
+    sys.modules.setdefault("discord.ext", ext_mod)
+    sys.modules.setdefault("discord.ext.commands", commands_mod)
+
+
+# This module sorts ahead of the other Discord test modules, so it must install
+# the shared discord stub before importing the adapter; otherwise the real
+# discord package lands in sys.modules and the later suites cannot mock it.
+_ensure_discord_mock()
+
+from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 
 
 class FakeTextChannel:
