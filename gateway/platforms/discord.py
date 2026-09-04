@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -441,6 +442,205 @@ class DiscordAdapter(BasePlatformAdapter):
         self._bot_participated_threads: set = self._load_participated_threads()
         # Cap to prevent unbounded growth (Discord threads get archived).
         self._MAX_TRACKED_THREADS = 500
+
+    def _a2a_enabled(self) -> bool:
+        return os.getenv("A2A_DISCORD_ENABLED", "").strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+
+    def _a2a_channel_ids(self) -> set[str]:
+        raw = (
+            os.getenv("A2A_DISCORD_CHANNEL_IDS")
+            or os.getenv("A2A_DISCORD_CHANNEL_ID")
+            or ""
+        )
+        return {part.strip() for part in raw.split(",") if part.strip()}
+
+    def _a2a_peer_user_ids(self) -> set[str]:
+        raw = (
+            os.getenv("A2A_DISCORD_PEER_USER_IDS")
+            or os.getenv("A2A_DISCORD_PEER_USER_ID")
+            or ""
+        )
+        peers = {part.strip() for part in raw.split(",") if part.strip()}
+        raw_pairs = os.getenv("A2A_DISCORD_PEERS", "")
+        for entry in raw_pairs.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            peers.add(entry.rsplit(":", 1)[-1].strip())
+        return {peer for peer in peers if peer}
+
+    def _a2a_state_path(self) -> Path:
+        base = Path(os.getenv("HERMES_HOME") or os.getenv("MONOLITH_HERMES_HOME") or Path.home() / ".hermes")
+        return base / "gateway" / "discord-a2a-state.json"
+
+    def _load_a2a_state(self) -> dict:
+        path = self._a2a_state_path()
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.warning("[%s] Could not read Discord A2A state: %s", self.name, exc)
+            return {}
+
+    def _save_a2a_state(self, state: dict) -> None:
+        path = self._a2a_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, sort_keys=True))
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("[%s] Could not write Discord A2A state: %s", self.name, exc)
+
+    def _a2a_conversation_key(self, message: DiscordMessage) -> str:
+        channel = getattr(message, "channel", None)
+        parent_id = getattr(channel, "parent_id", None)
+        channel_id = getattr(channel, "id", "")
+        return str(parent_id or channel_id)
+
+    def _a2a_channel_matches(self, message: DiscordMessage) -> bool:
+        channel_ids = self._a2a_channel_ids()
+        if not channel_ids:
+            return False
+        channel = getattr(message, "channel", None)
+        ids = {str(getattr(channel, "id", ""))}
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id:
+            ids.add(str(parent_id))
+        return "*" in channel_ids or bool(ids & channel_ids)
+
+    def _message_mentions_self(self, message: DiscordMessage) -> bool:
+        return bool(self._client and self._client.user and self._client.user in getattr(message, "mentions", []))
+
+    def _is_a2a_terminal(self, text: str) -> tuple[bool, str | None]:
+        stripped = text.strip().lower()
+        for marker in ("a2a:done", "a2a:stop", "a2a:blocked"):
+            if stripped.startswith(marker):
+                state = marker.split(":", 1)[1]
+                return True, "stopped" if state == "stop" else state
+        return False, None
+
+    def _is_a2a_start(self, text: str) -> bool:
+        stripped = text.strip().lower()
+        return stripped.startswith("a2a:start") or stripped.startswith("a2a:handoff") or " a2a:start" in stripped or " a2a:handoff" in stripped
+
+    def _a2a_text_without_self_mention(self, text: str) -> str:
+        stripped = text.strip()
+        user = getattr(self._client, "user", None) if self._client else None
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            return stripped
+        for mention in (f"<@{user_id}>", f"<@!{user_id}>"):
+            if stripped.startswith(mention):
+                return stripped[len(mention):].lstrip()
+        return stripped
+
+    def _is_a2a_ack_only(self, text: str) -> bool:
+        stripped = text.strip().lower()
+        if not stripped:
+            return True
+        if stripped in {"noted", "copy", "copied", "standing by", "silence maintained", ".", "ok", "okay", "👍", "✅"}:
+            return True
+        alnum = "".join(ch for ch in stripped if ch.isalnum())
+        return not alnum
+
+    def _a2a_max_turns(self) -> int:
+        try:
+            return max(1, int(os.getenv("A2A_DISCORD_MAX_TURNS", "12")))
+        except ValueError:
+            return 12
+
+    def _a2a_idle_seconds(self) -> int:
+        try:
+            return max(60, int(os.getenv("A2A_DISCORD_IDLE_SECONDS", "900")))
+        except ValueError:
+            return 900
+
+    def _a2a_allows_bot_message(self, message: DiscordMessage) -> bool:
+        """Hard gate for bot-authored Discord A2A traffic before model dispatch."""
+        if not self._a2a_enabled() or not self._a2a_channel_matches(message):
+            return True
+
+        author_id = str(getattr(getattr(message, "author", None), "id", ""))
+        peers = self._a2a_peer_user_ids()
+        if peers and author_id not in peers:
+            logger.info("[%s] Dropping A2A bot message from non-peer %s", self.name, author_id)
+            return False
+        if not self._message_mentions_self(message):
+            logger.info("[%s] Dropping A2A bot message without self mention", self.name)
+            return False
+
+        now = time.time()
+        key = self._a2a_conversation_key(message)
+        state = self._load_a2a_state()
+        record = state.get(key) if isinstance(state.get(key), dict) else {}
+        status = str(record.get("state") or "idle")
+        text = str(getattr(message, "content", "") or "")
+        broker_text = self._a2a_text_without_self_mention(text)
+        starts_conversation = self._is_a2a_start(broker_text)
+        if status in {"done", "stopped", "blocked", "expired"}:
+            if not starts_conversation:
+                return False
+            record = {}
+            status = "idle"
+        expires_at = float(record.get("expires_at") or 0)
+        if expires_at and now > expires_at:
+            if not starts_conversation:
+                record["state"] = "expired"
+                state[key] = record
+                self._save_a2a_state(state)
+                return False
+            record = {}
+            status = "idle"
+
+        terminal, terminal_state = self._is_a2a_terminal(broker_text)
+        if terminal:
+            record.update({"state": terminal_state or "done", "terminal_message_id": str(getattr(message, "id", "")), "updated_at": now})
+            state[key] = record
+            self._save_a2a_state(state)
+            return False
+
+        if self._is_a2a_ack_only(broker_text):
+            record.update({"state": "done", "terminal_reason": "ack_only", "updated_at": now})
+            state[key] = record
+            self._save_a2a_state(state)
+            return False
+
+        if status == "idle" and not starts_conversation:
+            return False
+
+        turn_count = int(record.get("turn_count") or 0)
+        if turn_count >= self._a2a_max_turns():
+            record.update({"state": "blocked", "terminal_reason": "max_turns", "updated_at": now})
+            state[key] = record
+            self._save_a2a_state(state)
+            return False
+        if str(record.get("last_actor_id") or "") == author_id:
+            return False
+
+        digest = hashlib.sha256(" ".join(text.split()).lower().encode()).hexdigest()
+        if record.get("last_message_hash") == digest:
+            return False
+
+        record.update({
+            "state": "open",
+            "turn_count": turn_count + 1,
+            "last_actor_id": author_id,
+            "last_message_hash": digest,
+            "last_message_id": str(getattr(message, "id", "")),
+            "updated_at": now,
+            "expires_at": now + self._a2a_idle_seconds(),
+        })
+        state[key] = record
+        self._save_a2a_state(state)
+        return True
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -535,6 +735,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     elif allow_bots == "mentions":
                         if not self._client.user or self._client.user not in message.mentions:
                             return
+                    if not adapter_self._a2a_allows_bot_message(message):
+                        return
                     # "all" falls through to handle_message
                 
                 await self._handle_message(message)
